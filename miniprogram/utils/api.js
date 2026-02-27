@@ -18,14 +18,39 @@ function extractSystemVersion(raw, fallback) {
     const parts = raw.split(' ');
     return parts.length > 1 ? parts[1] : parts[0] || fallback;
 }
-function parseEntranceGuardResponse(response) {
-    if (Array.isArray(response)) {
-        for (const item of response) {
-            if (item && Array.isArray(item.data_list) && item.data_list.length) {
-                return item.data_list;
-            }
+function collectEntranceGuardItems(source) {
+    const merged = [];
+    const walk = (node) => {
+        if (!node) {
+            return;
         }
-        return [];
+        if (Array.isArray(node)) {
+            for (const item of node) {
+                walk(item);
+            }
+            return;
+        }
+        if (typeof node !== 'object') {
+            return;
+        }
+        const record = node;
+        if (Array.isArray(record.data_list)) {
+            merged.push(...record.data_list);
+        }
+        if (record.obj) {
+            walk(record.obj);
+        }
+    };
+    walk(source);
+    return merged;
+}
+function parseEntranceGuardResponse(response) {
+    const merged = collectEntranceGuardItems(response);
+    if (merged.length) {
+        return merged;
+    }
+    if (Array.isArray(response)) {
+        return response;
     }
     if (response && typeof response === 'object') {
         const payload = response;
@@ -76,18 +101,48 @@ function request(options) {
         });
     });
 }
-function createDeviceProfile() {
+function collectDeviceProfile() {
     const defaults = {
         brand: 'Apple',
         model: 'iPhone15,3',
         osVersion: '26.0'
     };
+    try {
+        const wxAny = wx;
+        const readers = [
+            () => (typeof wxAny.getDeviceInfo === 'function' ? wxAny.getDeviceInfo() : null),
+            () => (typeof wxAny.getAppBaseInfo === 'function' ? wxAny.getAppBaseInfo() : null),
+            () => (typeof wxAny.getWindowInfo === 'function' ? wxAny.getWindowInfo() : null)
+        ];
+        for (const reader of readers) {
+            try {
+                const info = reader();
+                if (!info || typeof info !== 'object') {
+                    continue;
+                }
+                if (typeof info.brand === 'string' && info.brand) {
+                    defaults.brand = info.brand;
+                }
+                if (typeof info.model === 'string' && info.model) {
+                    defaults.model = info.model;
+                }
+                const system = info.system || info.osVersion;
+                defaults.osVersion = extractSystemVersion(system, defaults.osVersion);
+            }
+            catch (readerErr) {
+                console.debug('[api] 读取设备信息失败', readerErr);
+            }
+        }
+    }
+    catch (err) {
+        console.warn('[api] 获取设备信息失败', err);
+    }
     return defaults;
 }
 function buildLoginPayload(phone, idcardNo) {
-    const profile = createDeviceProfile();
+    const profile = collectDeviceProfile();
     const trimmedPhone = (phone || '').trim();
-    const normalizedPhone = trimmedPhone ? trimmedPhone : '17777777777'; // 默认手机号，避免接口报错                
+    const normalizedPhone = trimmedPhone ? trimmedPhone : '17777777777';
     return {
         sex: 0,
         idcardNo,
@@ -96,7 +151,8 @@ function buildLoginPayload(phone, idcardNo) {
             wifiMac: '02:00:00:00:00:00',
             brand: profile.brand,
             os: 0,
-            udid: '00000000-0000-0000-0000-000000000000', 
+            // 脱敏处理：发布版不保留开发者设备标识
+            udid: '00000000-0000-0000-0000-000000000000',
             appVersion: '1.3.6',
             imsi: '46015',
             model: profile.model

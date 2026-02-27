@@ -2,7 +2,7 @@
   <view class="card">
     <view class="card-title center">免责声明</view>
     <view class="card-list">
-      <view class="list-item dot">本程序没有任何云端和后门，所有门禁参数仅保存在本机，可随时通过微信缓存清理移除。</view>
+      <view class="list-item dot">本程序没有任何云端和后门，所有门禁参数仅保存在当前设备，可随时通过清理微信缓存移除。</view>
       <view class="list-item dot">本程序仅调用平安回家官方接口，不修改或绕过官方鉴权，不会在微信缓存中保存个人身份信息。</view>
       <view class="list-item dot">本程序永久完全免费，仅供学习交流使用，禁止用于其他任何商业或非法用途。</view>
     </view>
@@ -144,6 +144,13 @@
     <view class="tip-list">
       <view class="tip-item">
         <view class="tip-header">
+          <view class="tip-icon shortcut">添</view>
+          <view class="tip-label">添加到我的小程序</view>
+        </view>
+        <view class="tip-desc">可点击右上角，将本程序「添加到我的小程序」，方便需要使用时能快速找到。</view>
+      </view>
+      <view class="tip-item">
+        <view class="tip-header">
           <view class="tip-icon fast">⚡</view>
           <view class="tip-label">快速开锁</view>
         </view>
@@ -174,14 +181,14 @@
   <view class="card">
     <view class="card-title">提交 Bug / 反馈建议</view>
     <view class="info-block">
-      <view class="info-paragraph">遇到问题或有优化建议，可通过以下方式联系开发者：</view>
+      <view class="info-paragraph">遇到问题或有优化建议，可通过以下公开渠道反馈：</view>
       <view class="info-contact">
-        <view class="info-label">邮箱</view>
-        <text class="code link" user-select="true" bindtap="onMailTap" data-mail="collin4561@163.com">collin4561@163.com</text>
+        <view class="info-label">邮箱（占位）</view>
+        <text class="code link" user-select="true" bindtap="onMailTap" data-mail="support@example.com">support@example.com</text>
       </view>
       <view class="info-contact">
-        <view class="info-label">Issue</view>
-        <text class="code link" user-select="true" bindtap="onIssueTap" data-url="https://github.com/1136623363/BaiyunKeys-preview/issues">https://github.com/1136623363/BaiyunKeys-preview/issues</text>
+        <view class="info-label">Issue（占位）</view>
+        <text class="code link" user-select="true" bindtap="onIssueTap" data-url="https://github.com/your-org/your-repo/issues">https://github.com/your-org/your-repo/issues</text>
       </view>
       <view class="info-hint">建议附上关键截图或调试日志，便于快速定位问题。</view>
     </view>

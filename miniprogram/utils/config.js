@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.DEFAULT_CONFIG = void 0;
+exports.DEFAULT_CONFIG = exports.AUTO_RETRY_UNLOCK_COUNT_DEFAULT = exports.AUTO_RETRY_UNLOCK_COUNT_MAX = exports.AUTO_RETRY_UNLOCK_COUNT_MIN = void 0;
 exports.createEmptyDoorConfig = createEmptyDoorConfig;
 exports.readDoorConfigList = readDoorConfigList;
 exports.readDoorConfig = readDoorConfig;
@@ -11,9 +11,19 @@ exports.readLogPreference = readLogPreference;
 exports.saveLogPreference = saveLogPreference;
 exports.readQuickUnlockPreference = readQuickUnlockPreference;
 exports.saveQuickUnlockPreference = saveQuickUnlockPreference;
+exports.normalizeAutoRetryUnlockCount = normalizeAutoRetryUnlockCount;
+exports.readAutoRetryUnlockPreference = readAutoRetryUnlockPreference;
+exports.saveAutoRetryUnlockPreference = saveAutoRetryUnlockPreference;
+exports.readAutoRetryUnlockCountPreference = readAutoRetryUnlockCountPreference;
+exports.saveAutoRetryUnlockCountPreference = saveAutoRetryUnlockCountPreference;
 const CONFIG_STORAGE_KEY = 'doorConfig';
 const LOG_PREF_STORAGE_KEY = 'doorLogEnabled';
 const QUICK_UNLOCK_PREF_STORAGE_KEY = 'quickUnlockEnabled';
+const AUTO_RETRY_UNLOCK_PREF_STORAGE_KEY = 'autoRetryUnlockEnabled';
+const AUTO_RETRY_UNLOCK_COUNT_STORAGE_KEY = 'autoRetryUnlockCount';
+exports.AUTO_RETRY_UNLOCK_COUNT_MIN = 1;
+exports.AUTO_RETRY_UNLOCK_COUNT_MAX = 99;
+exports.AUTO_RETRY_UNLOCK_COUNT_DEFAULT = 8;
 const DEFAULT_STATE = {
     version: 2,
     currentId: null,
@@ -185,4 +195,64 @@ function saveQuickUnlockPreference(enabled) {
     catch (err) {
         console.warn('[config] 保存快速开锁偏好失败', err);
     }
+}
+function normalizeAutoRetryUnlockCount(count) {
+    if (count === null || typeof count === 'undefined') {
+        return exports.AUTO_RETRY_UNLOCK_COUNT_DEFAULT;
+    }
+    if (typeof count === 'string' && !count.trim()) {
+        return exports.AUTO_RETRY_UNLOCK_COUNT_DEFAULT;
+    }
+    const value = typeof count === 'number' ? count : Number(count);
+    if (!Number.isFinite(value)) {
+        return exports.AUTO_RETRY_UNLOCK_COUNT_DEFAULT;
+    }
+    const intCount = Math.floor(value);
+    if (intCount < exports.AUTO_RETRY_UNLOCK_COUNT_MIN) {
+        return exports.AUTO_RETRY_UNLOCK_COUNT_MIN;
+    }
+    if (intCount > exports.AUTO_RETRY_UNLOCK_COUNT_MAX) {
+        return exports.AUTO_RETRY_UNLOCK_COUNT_MAX;
+    }
+    return intCount;
+}
+function readAutoRetryUnlockPreference() {
+    try {
+        const stored = wx.getStorageSync(AUTO_RETRY_UNLOCK_PREF_STORAGE_KEY);
+        if (typeof stored === 'boolean') {
+            return stored;
+        }
+    }
+    catch (err) {
+        console.warn('[config] 读取自动重发偏好失败', err);
+    }
+    return false;
+}
+function saveAutoRetryUnlockPreference(enabled) {
+    try {
+        wx.setStorageSync(AUTO_RETRY_UNLOCK_PREF_STORAGE_KEY, !!enabled);
+    }
+    catch (err) {
+        console.warn('[config] 保存自动重发偏好失败', err);
+    }
+}
+function readAutoRetryUnlockCountPreference() {
+    try {
+        const stored = wx.getStorageSync(AUTO_RETRY_UNLOCK_COUNT_STORAGE_KEY);
+        return normalizeAutoRetryUnlockCount(stored);
+    }
+    catch (err) {
+        console.warn('[config] 读取自动重发次数失败', err);
+        return exports.AUTO_RETRY_UNLOCK_COUNT_DEFAULT;
+    }
+}
+function saveAutoRetryUnlockCountPreference(count) {
+    const normalized = normalizeAutoRetryUnlockCount(count);
+    try {
+        wx.setStorageSync(AUTO_RETRY_UNLOCK_COUNT_STORAGE_KEY, normalized);
+    }
+    catch (err) {
+        console.warn('[config] 保存自动重发次数失败', err);
+    }
+    return normalized;
 }

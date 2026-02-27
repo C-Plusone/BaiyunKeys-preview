@@ -197,8 +197,56 @@
 
 .actions {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: stretch;
   gap: 20rpx;
+}
+
+.share-btn {
+  flex: 1;
+  height: 96rpx;
+  border-radius: 18rpx;
+  border: 2rpx solid #93c5fd;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 30rpx;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.share-btn::after {
+  border: none;
+}
+
+.share-btn[disabled] {
+  border-color: #cbd5e1;
+  background: #f1f5f9;
+  color: #94a3b8;
+}
+
+.actions .primary {
+  flex: 1;
+  width: auto;
+}
+
+.quick-actions {
+  display: flex;
+  gap: 20rpx;
+}
+
+.quick-action-btn {
+  flex: 1;
+  width: auto;
+  height: 82rpx;
+  font-size: 28rpx;
+  border-color: #bfdbfe;
+  background: #f8fbff;
+}
+
+.quick-action-btn::after {
+  border: none;
 }
 
 .primary {
@@ -308,6 +356,31 @@
   margin-top: 6rpx;
 }
 
+.retry-controls {
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+}
+
+.retry-count-input {
+  width: 84rpx;
+  height: 56rpx;
+  border-radius: 12rpx;
+  border: 2rpx solid #e2e8f0;
+  background: #f8fafc;
+  font-size: 26rpx;
+  color: #0f172a;
+  text-align: center;
+  padding: 0 10rpx;
+  box-sizing: border-box;
+}
+
+.retry-unit {
+  font-size: 24rpx;
+  color: #64748b;
+  min-width: 26rpx;
+}
+
 .copy-overlay {
   position: fixed;
   left: 0;
@@ -350,6 +423,59 @@
   gap: 12rpx;
 }
 
+.backup-select-list {
+  max-height: 520rpx;
+}
+
+.backup-select-item {
+  display: flex;
+  align-items: center;
+  gap: 18rpx;
+  padding: 16rpx 12rpx;
+  border-radius: 14rpx;
+  border: 2rpx solid rgba(148, 163, 184, 0.35);
+  background: #f8fafc;
+}
+
+.backup-select-check {
+  width: 34rpx;
+  height: 34rpx;
+  border-radius: 8rpx;
+  border: 2rpx solid #94a3b8;
+  color: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22rpx;
+  font-weight: 700;
+}
+
+.backup-select-check.checked {
+  border-color: #2563eb;
+  background: #2563eb;
+  color: #ffffff;
+}
+
+.backup-select-name {
+  flex: 1;
+  font-size: 28rpx;
+  color: #1f2937;
+}
+
+.backup-textarea {
+  width: 100%;
+  min-height: 300rpx;
+  max-height: 420rpx;
+  border-radius: 18rpx;
+  border: 2rpx solid #dbeafe;
+  background: #f8fbff;
+  padding: 20rpx;
+  box-sizing: border-box;
+  font-size: 28rpx;
+  color: #0f172a;
+  line-height: 1.6;
+}
+
 .copy-line {
   font-size: 28rpx;
   color: #475569;
@@ -362,8 +488,18 @@
   gap: 24rpx;
 }
 
+.copy-actions.backup-toolbar {
+  justify-content: flex-end;
+}
+
 .copy-actions.single {
   justify-content: center;
+}
+
+.share-confirm[disabled] {
+  background: rgba(148, 163, 184, 0.6);
+  box-shadow: none;
+  color: #f8fafc;
 }
 
 .primary.small.full {

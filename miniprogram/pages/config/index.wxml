@@ -45,13 +45,14 @@
       <view class="field" wx:if="{{isIOS}}">
         <view class="label label-inline">
           <text class="label-main">蓝牙名称</text>
-          <text class="label-note">(bluetoothName)</text>
+          <text class="label-note">(bluetoothName，iOS 必填)</text>
         </view>
         <input class="input" placeholder="如 BYXXXX" value="{{form.bluetoothName}}" bindinput="onBluetoothNameInput" maxlength="20" />
       </view>
     </view>
 
     <view class="actions">
+      <button class="share-btn" bindtap="onShareButtonTap" disabled="{{!form.id || saving}}">分享门禁</button>
       <button class="primary" type="primary" bindtap="onSave" loading="{{saving}}" disabled="{{!canSave || saving}}">保存配置</button>
     </view>
   </view>
@@ -75,7 +76,15 @@
     </view>
 
     <view class="info-box">
-      <text class="info-text" user-select="true">1.本功能仅调用平安回家官方接口获取数据，不含任何后门，也不会将个人身份信息保存在本地；\n2.门禁参数仅保存在本机，建议成功获取后立即复制备份，避免平安回家APP过期后无法再次获取；\n3.本功能会为你自动新建并保存一份门禁配置。</text>
+      <text class="info-text" user-select="true">1.本功能仅调用平安回家官方接口获取数据，不含任何后门，也不会将个人身份信息保存在本地；\n2.门禁参数仅保存在当前设备，建议成功获取后立即复制备份，避免平安回家APP过期后无法再次获取；\n3.本功能会为你自动新建并保存门禁配置。</text>
+    </view>
+  </view>
+
+  <view class="card">
+    <view class="card-title">备份/恢复</view>
+    <view class="quick-actions">
+      <button class="ghost quick-action-btn" bindtap="onCopyBackup" disabled="{{saving}}">一键复制</button>
+      <button class="ghost quick-action-btn" bindtap="onImportBackup" disabled="{{saving}}">一键导入</button>
     </view>
   </view>
 
@@ -89,10 +98,102 @@
     </view>
     <view class="toggle-row">
       <view class="toggle-label">
+        <view>自动重发</view>
+        <view class="toggle-note">扫描蓝牙设备超时后立即重试开锁</view>
+      </view>
+      <view class="retry-controls">
+        <input
+          class="retry-count-input"
+          type="number"
+          value="{{autoRetryUnlockCount}}"
+          bindinput="onAutoRetryUnlockCountInput"
+          bindblur="onAutoRetryUnlockCountBlur"
+          maxlength="2"
+        />
+        <view class="retry-unit">次</view>
+        <switch checked="{{autoRetryUnlockEnabled}}" bindchange="onAutoRetryUnlockToggle" color="#f59e0b" />
+      </view>
+    </view>
+    <view class="toggle-row">
+      <view class="toggle-label">
         <view>调试日志输出</view>
         <view class="toggle-note">开启后将在首页显示实时蓝牙日志</view>
       </view>
       <switch checked="{{logEnabled}}" bindchange="onLogToggle" color="#60a5fa" />
+    </view>
+  </view>
+
+  <view class="copy-overlay" wx:if="{{backupCopyPrompt.visible}}">
+    <view class="copy-modal">
+      <view class="copy-title">选择要复制的门禁</view>
+      <view class="copy-content backup-select-list">
+        <block wx:for="{{backupCopyPrompt.items}}" wx:key="id">
+          <view class="backup-select-item" bindtap="onBackupCopyToggle" data-id="{{item.id}}">
+            <view class="backup-select-check {{item.checked ? 'checked' : ''}}">{{item.checked ? '✓' : ''}}</view>
+            <view class="backup-select-name">{{item.name}}</view>
+          </view>
+        </block>
+      </view>
+      <view class="copy-actions backup-toolbar">
+        <button class="ghost small" bindtap="onBackupCopyToggleAll">{{backupCopyPrompt.selectedCount === backupCopyPrompt.items.length && backupCopyPrompt.items.length > 0 ? '取消全选' : '全选'}}</button>
+      </view>
+      <view class="copy-actions">
+        <button class="ghost small" bindtap="onBackupCopyCancel">取消</button>
+        <button class="primary small" bindtap="onBackupCopyConfirm" disabled="{{backupCopyPrompt.selectedCount === 0}}">复制参数</button>
+      </view>
+    </view>
+  </view>
+
+  <view class="copy-overlay" wx:if="{{backupImportInput.visible}}">
+    <view class="copy-modal">
+      <view class="copy-title">粘贴门禁参数</view>
+      <textarea
+        class="backup-textarea"
+        placeholder="请粘贴一键复制的门禁参数文本"
+        value="{{backupImportInput.text}}"
+        bindinput="onBackupImportInput"
+        maxlength="-1"
+      />
+      <view class="copy-actions">
+        <button class="ghost small" bindtap="onBackupImportCancel">取消</button>
+        <button class="primary small" bindtap="onBackupImportConfirm" disabled="{{!backupImportInput.text}}">开始导入</button>
+      </view>
+    </view>
+  </view>
+
+  <view class="copy-overlay" wx:if="{{sharePrompt.visible}}">
+    <view class="copy-modal">
+      <view class="copy-title">安全提醒</view>
+      <view class="copy-content">
+        <view class="copy-line">您将分享当前门禁参数，门禁信息属于敏感数据，泄露可能导致他人未经授权开门。</view>
+        <view class="copy-line">【1】请确认接收方为可信亲友。</view>
+        <view class="copy-line">【2】请通过私聊方式分享。</view>
+        <view class="copy-line">【3】请勿在群聊、朋友圈等公开场景传播。</view>
+        <view class="copy-line">【4】请勿将门禁参数分享给陌生人。</view>
+        <view class="copy-line">【5】分享链接有效时间默认为24小时。</view>
+        <view class="copy-line">【6】请谨慎分享，泄露风险需自行承担。</view>
+      </view>
+      <view class="copy-actions">
+        <button class="ghost small" bindtap="onShareReminderCancel">取消</button>
+        <button class="primary small share-confirm" open-type="share" bindtap="onShareReminderConfirm" disabled="{{sharePrompt.countdown > 0}}">
+          <block wx:if="{{sharePrompt.countdown > 0}}">{{sharePrompt.countdown}}秒后可分享</block>
+          <block wx:else>我已知悉，确认分享</block>
+        </button>
+      </view>
+    </view>
+  </view>
+
+  <view class="copy-overlay" wx:if="{{importPrompt.visible}}">
+    <view class="copy-modal">
+      <view class="copy-title">门禁导入成功</view>
+      <view class="copy-content">
+        <block wx:for="{{importPrompt.lines}}" wx:key="*this">
+          <view class="copy-line">{{item}}</view>
+        </block>
+      </view>
+      <view class="copy-actions single">
+        <button class="primary small full" bindtap="onImportPromptConfirm">确定</button>
+      </view>
     </view>
   </view>
 

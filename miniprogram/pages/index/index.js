@@ -14,6 +14,10 @@ const USER_ACK_TIMEOUT = 3500;
 const FLOW_TIMEOUT = 45000;
 const PREWARM_SCAN_DURATION = 600;
 const LAST_DEVICE_STORAGE_KEY = 'lastDoorDeviceMap';
+const LOG_MAX_LINES = 80;
+const LOG_PREVIEW_HEX_LENGTH = 64;
+const FLOW_ABORT_MESSAGE = 'flow aborted';
+const FLOW_ABORT_DISPLAY_MESSAGE = '已中断当前开锁流程';
 let quickUnlockSessionUsed = false;
 function callWx(fn, options = {}) {
     return new Promise((resolve, reject) => {
@@ -31,6 +35,37 @@ function callWx(fn, options = {}) {
 }
 function pad(num) {
     return num.toString().padStart(2, '0');
+}
+function padMs(num) {
+    return num.toString().padStart(3, '0');
+}
+function previewHex(hex, maxLength = LOG_PREVIEW_HEX_LENGTH) {
+    if (!hex) {
+        return '';
+    }
+    return hex.length > maxLength ? `${hex.slice(0, maxLength)}...` : hex;
+}
+function formatError(err) {
+    if (!err) {
+        return 'unknown';
+    }
+    if (typeof err === 'string') {
+        return err;
+    }
+    const obj = err;
+    const code = typeof obj.errCode !== 'undefined' ? `code=${obj.errCode}` : '';
+    const msg = typeof obj.errMsg === 'string' ? `msg=${obj.errMsg}` : '';
+    const message = typeof obj.message === 'string' ? `message=${obj.message}` : '';
+    const merged = [code, msg, message].filter(Boolean).join(' ');
+    if (merged) {
+        return merged;
+    }
+    try {
+        return JSON.stringify(err);
+    }
+    catch (_jsonErr) {
+        return String(err);
+    }
 }
 function normalizeMacForCompare(mac) {
     return mac.replace(/[^0-9A-F]/g, '').toUpperCase();
@@ -180,6 +215,9 @@ Page({
         ble: createBleState(),
         isIOS: false,
         quickUnlockEnabled: false,
+        autoRetryUnlockEnabled: false,
+        autoRetryUnlockCount: 8,
+        autoRetrying: false,
         disclaimerVisible: false,
         disclaimerCountdown: 0
     },
@@ -248,6 +286,7 @@ Page({
         const command = hex.length >= 6 ? hex.substr(4, 2).toUpperCase() : '';
         const tail = hex.slice(-2).toUpperCase();
         const type = hex.length >= 20 ? hex.substr(18, 2).toUpperCase() : '';
+        this.addLog(`[通知解析] len=${Math.floor(hex.length / 2)}B header=${header || '--'} cmd=${command || '--'} type=${type || '--'} tail=${tail || '--'}`);
         const resolveAck = (payload = buffer) => {
             if (self._ackResolve) {
                 const resolver = self._ackResolve;
@@ -296,7 +335,7 @@ Page({
                 const codeHigh = hex.slice(-4, -2);
                 const codeLow = hex.slice(-6, -4);
                 const codeWord = `${codeHigh}${codeLow}`;
-                this.finalizeBleFlow(false, `握手失败，设备返回 0x${codeWord}`);
+                this.finalizeBleFlow(false, `握手失败，设备返回码 0x${codeWord}`);
                 return;
             }
             return;
@@ -325,7 +364,7 @@ Page({
                     tempCommKey: tempKey,
                     communicateBuffer: ''
                 });
-                this.addLog('通信密钥协商成功');
+                this.addLog('通讯密钥协商成功');
             }
             else {
                 updateBleState(this, { communicateBuffer: concatBuffer });
@@ -449,6 +488,8 @@ Page({
         const form = (0, configView_1.normalizeConfigForForm)(active);
         const logEnabled = (0, config_1.readLogPreference)();
         const quickUnlockEnabled = (0, config_1.readQuickUnlockPreference)();
+        const autoRetryUnlockEnabled = (0, config_1.readAutoRetryUnlockPreference)();
+        const autoRetryUnlockCount = (0, config_1.readAutoRetryUnlockCountPreference)();
         const nextForm = { ...form, logEnabled };
         const { configs, configNames, configOptions, selectedConfigIndex } = (0, configView_1.buildConfigCollections)(list, nextForm.id || null);
         const payload = {
@@ -460,7 +501,9 @@ Page({
             form: nextForm,
             canSubmit: this.canSubmitForm(nextForm),
             consoleSync: logEnabled,
-            quickUnlockEnabled
+            quickUnlockEnabled,
+            autoRetryUnlockEnabled,
+            autoRetryUnlockCount
         };
         if (!logEnabled) {
             payload.logs = [];
@@ -579,14 +622,15 @@ Page({
             self._stage = 'idle';
             resolver(null);
         }
-        this.addLog(message, success);
+        const duration = typeof self._flowStartAt === 'number' ? Date.now() - self._flowStartAt : null;
+        this.addLog(duration !== null ? (message + '（总耗时 ' + duration + 'ms）') : message, success);
         this.setStateMessage(message);
         wx.showToast({
             title: message,
             icon: success ? 'success' : 'none',
             duration: 3000
         });
-        this.setData({ 'state.loading': false });
+        this.setData({ 'state.loading': false, autoRetrying: false });
         this.cleanupBluetooth().catch(() => undefined);
     },
     startAckTimer(message) {
@@ -610,109 +654,221 @@ Page({
             self._ackTimeoutHandle = null;
         }
     },
+    isFlowAbortedReason(reason) {
+        if (!reason) {
+            return false;
+        }
+        return reason.includes(FLOW_ABORT_MESSAGE) || reason.includes(FLOW_ABORT_DISPLAY_MESSAGE);
+    },
+    throwIfFlowAborted() {
+        const self = this;
+        if (self._interruptRequested) {
+            throw new Error(FLOW_ABORT_MESSAGE);
+        }
+    },
+    async onAbortUnlock() {
+        if (!this.data.state.loading) {
+            return;
+        }
+        const self = this;
+        if (self._abortingUnlock) {
+            return;
+        }
+        self._abortingUnlock = true;
+        self._interruptRequested = true;
+        this.addLog('[中断] 用户请求中断当前开锁流程');
+        this.setStateMessage('正在中断当前开锁流程...');
+        this.setData({ 'state.loading': false, autoRetrying: false });
+        try {
+            if (typeof self._activeScanCancel === 'function') {
+                const cancelScan = self._activeScanCancel;
+                self._activeScanCancel = null;
+                cancelScan();
+            }
+            if (self._seedReject) {
+                const seedReject = self._seedReject;
+                self._seedResolve = null;
+                self._seedReject = null;
+                self._stage = 'idle';
+                seedReject(new Error(FLOW_ABORT_MESSAGE));
+            }
+            if (self._ackResolve) {
+                const ackResolve = self._ackResolve;
+                self._ackResolve = null;
+                self._stage = 'idle';
+                ackResolve(null);
+            }
+            await this.cleanupBluetooth();
+            this.setStateMessage(FLOW_ABORT_DISPLAY_MESSAGE);
+            wx.showToast({ title: FLOW_ABORT_DISPLAY_MESSAGE, icon: 'none', duration: 1200 });
+        }
+        finally {
+            self._abortingUnlock = false;
+        }
+    },
+    shouldAutoRetryUnlock(reason, retryRemaining) {
+        const self = this;
+        return (!self._interruptRequested &&
+            this.data.autoRetryUnlockEnabled &&
+            retryRemaining > 0 &&
+            typeof reason === 'string' &&
+            reason.includes('扫描蓝牙设备超时'));
+    },
+    getReadableErrorMessage(reason) {
+        const text = typeof reason === 'string' ? reason : '';
+        const lower = text.toLowerCase();
+        if (lower.includes('scanning too frequently')) {
+            return '蓝牙扫描触发过于频繁，请稍候 1-2 秒后重试';
+        }
+        return text || '操作失败';
+    },
     async onSubmit() {
         if (this.data.state.loading || !this.data.canSubmit) {
             return;
         }
         const self = this;
+        self._interruptRequested = false;
+        self._activeScanCancel = null;
         const form = this.data.form;
         const mac = (form.mac || '').trim().toUpperCase();
-        this.resetBleRuntime();
-        this.setData({
-            'state.loading': true,
-            'state.message': '正在检查权限...',
-            logs: []
-        });
-        this.addLog('开始蓝牙开锁流程');
-        try {
-            await this.ensurePermissions();
-            this.setStateMessage('正在初始化蓝牙...');
-            await this.ensureBluetoothReady();
-            this.addLog('蓝牙适配器已就绪');
-            let deviceId = null;
-            let deviceLabel = '';
-            const cachedDeviceId = readCachedDeviceId(form);
-            if (cachedDeviceId) {
-                this.addLog(`尝试使用缓存设备：${cachedDeviceId}`);
-                this.setStateMessage('正在连接门锁...');
-                try {
-                    await this.connectDevice(cachedDeviceId, 6000);
-                    deviceId = cachedDeviceId;
-                    deviceLabel = cachedDeviceId;
-                    this.addLog('已直接连接缓存设备');
-                }
-                catch (error) {
-                    const reason = error && typeof error.errMsg === 'string'
-                        ? error.errMsg
-                        : error instanceof Error
-                            ? error.message
-                            : '未知错误';
-                    this.addLog(`缓存设备连接失败：${reason}`);
-                    removeCachedDeviceId(form);
-                    await callWx(wx.closeBLEConnection, {
-                        deviceId: cachedDeviceId
-                    }).catch(() => undefined);
-                }
+        let retryRemaining = this.data.autoRetryUnlockEnabled
+            ? Math.max(0, Number(this.data.autoRetryUnlockCount) || 0)
+            : 0;
+        let attempt = 0;
+        while (true) {
+            attempt += 1;
+            self._flowStartAt = Date.now();
+            this.resetBleRuntime();
+            const statePayload = {
+                'state.loading': true,
+                'state.message': attempt === 1 ? '正在检查权限...' : ('正在自动重发（第 ' + attempt + ' 次）...')
+            };
+            statePayload.autoRetrying = attempt > 1;
+            if (attempt === 1) {
+                statePayload.logs = [];
             }
-            if (!deviceId) {
-                this.setStateMessage('正在扫描门锁...');
-                const device = await this.discoverDevice(mac);
-                deviceId = device.deviceId;
-                const aliasName = device && device && typeof device.localName === 'string'
-                    ? device.localName
-                    : undefined;
-                deviceLabel = device.name || aliasName || device.deviceId;
-                this.addLog(`找到设备：${deviceLabel}`);
-                this.setStateMessage('正在连接门锁...');
-                await this.connectDevice(device.deviceId);
-            }
-            else if (deviceLabel) {
-                this.addLog(`继续使用缓存设备：${deviceLabel}`);
-            }
-            if (!deviceId) {
-                throw new Error('未找到可用的门锁设备');
-            }
-            this.addLog('蓝牙连接成功');
-            this.setStateMessage('正在初始化蓝牙服务...');
-            const channel = await this.prepareChannel(deviceId);
-            this.addLog('读取蓝牙特征成功');
-            await this.enableNotifications(deviceId, channel.serviceId, channel.notifyIds);
-            const seed = await this.readSeed(deviceId, channel.serviceId, channel.readId);
-            const seedHex = (0, lockBiz_1.bufferToHex)(seed);
-            this.addLog(`随机数：${seedHex}`);
-            self._randomSeed = seed;
-            updateBleState(this, { randomSeedHex: seedHex });
-            const headerBytes = deriveHeaderFromMac(form.mac);
-            const keyHex = (0, lockBiz_1.sanitizeKey)(form.key || '');
-            if (!keyHex) {
-                throw new Error('缺少可用的解锁 Key');
-            }
-            const handshake = (0, bleProtocol_1.buildHandshakeCommandWithHeader)(seed, headerBytes, keyHex);
-            this.addLog(`握手指令：${(0, lockBiz_1.bytesToHex)(handshake)}`);
-            await this.writeCommand(deviceId, channel.serviceId, channel.writeId, handshake);
-            updateBleState(this, { handshakeSent: true });
-            this.startAckTimer('握手指令已发送，等待门锁响应...');
-            await this.waitForAck();
-        }
-        catch (err) {
-            const reason = typeof err === 'string'
-                ? err
-                : err && typeof err.errMsg === 'string'
-                    ? err.errMsg
-                    : err instanceof Error
-                        ? err.message
-                        : '操作失败';
-            this.setData({ 'state.loading': false });
-            this.addLog(`错误：${reason}`);
-            this.setStateMessage(reason);
-        }
-        finally {
-            if (self._bleFinalized) {
-                self._bleFinalized = false;
+            this.setData(statePayload);
+            if (attempt === 1) {
+                this.addLog('开始蓝牙开锁流程 [platform=' + (this.data.isIOS ? 'ios' : 'android/other') + ']');
+                this.addLog('门禁配置已载入，开始执行蓝牙流程');
             }
             else {
-                await this.cleanupBluetooth();
-                this.setData({ 'state.loading': false });
+                this.addLog('[自动重发] 开始第 ' + attempt + ' 次尝试，剩余可重发 ' + retryRemaining + ' 次');
+            }
+            try {
+                await this.ensurePermissions();
+                this.throwIfFlowAborted();
+                this.setStateMessage('正在初始化蓝牙...');
+                await this.ensureBluetoothReady();
+                this.throwIfFlowAborted();
+                this.addLog('蓝牙适配器已就绪');
+                let deviceId = null;
+                let deviceLabel = '';
+                const cachedDeviceId = readCachedDeviceId(form);
+                if (cachedDeviceId) {
+                    this.addLog('尝试使用缓存设备：' + cachedDeviceId);
+                    this.setStateMessage('正在连接门锁...');
+                    try {
+                        await this.connectDevice(cachedDeviceId, 6000);
+                        this.throwIfFlowAborted();
+                        deviceId = cachedDeviceId;
+                        deviceLabel = cachedDeviceId;
+                        this.addLog('已直接连接缓存设备');
+                    }
+                    catch (error) {
+                        const reason = error && typeof error.errMsg === 'string'
+                            ? error.errMsg
+                            : error instanceof Error
+                                ? error.message
+                                : '未知错误';
+                        this.addLog('缓存设备连接失败：' + reason);
+                        removeCachedDeviceId(form);
+                        await callWx(wx.closeBLEConnection, {
+                            deviceId: cachedDeviceId
+                        }).catch(() => undefined);
+                    }
+                }
+                if (!deviceId) {
+                    this.setStateMessage('正在扫描门锁...');
+                    const device = await this.discoverDevice(mac);
+                    this.throwIfFlowAborted();
+                    deviceId = device.deviceId;
+                    const aliasName = device && device && typeof device.localName === 'string'
+                        ? device.localName
+                        : undefined;
+                    deviceLabel = device.name || aliasName || device.deviceId;
+                    this.addLog('找到设备：' + deviceLabel);
+                    this.setStateMessage('正在连接门锁...');
+                    await this.connectDevice(device.deviceId);
+                    this.throwIfFlowAborted();
+                }
+                else if (deviceLabel) {
+                    this.addLog('继续使用缓存设备：' + deviceLabel);
+                }
+                if (!deviceId) {
+                    throw new Error('未找到可用的门锁设备');
+                }
+                this.addLog('蓝牙连接成功');
+                this.setStateMessage('正在初始化蓝牙服务...');
+                const channel = await this.prepareChannel(deviceId);
+                this.addLog('读取蓝牙特征成功');
+                await this.enableNotifications(deviceId, channel.serviceId, channel.notifyIds);
+                this.throwIfFlowAborted();
+                const seed = await this.readSeed(deviceId, channel.serviceId, channel.readId);
+                this.throwIfFlowAborted();
+                const seedHex = (0, lockBiz_1.bufferToHex)(seed);
+                this.addLog(`随机数：${seedHex}`);
+                self._randomSeed = seed;
+                updateBleState(this, { randomSeedHex: seedHex });
+                const headerBytes = deriveHeaderFromMac(form.mac);
+                const keyHex = (0, lockBiz_1.sanitizeKey)(form.key || '');
+                if (!keyHex) {
+                    throw new Error('缺少可用的开锁 Key');
+                }
+                const handshake = (0, bleProtocol_1.buildHandshakeCommandWithHeader)(seed, headerBytes, keyHex);
+                this.addLog('握手指令：' + (0, lockBiz_1.bytesToHex)(handshake));
+                await this.writeCommand(deviceId, channel.serviceId, channel.writeId, handshake);
+                updateBleState(this, { handshakeSent: true });
+                this.startAckTimer('握手指令已发送，等待门锁响应...');
+                await this.waitForAck();
+                this.throwIfFlowAborted();
+                return;
+            }
+            catch (err) {
+                const reason = typeof err === 'string'
+                    ? err
+                    : err && typeof err.errMsg === 'string'
+                        ? err.errMsg
+                        : err instanceof Error
+                            ? err.message
+                            : '操作失败';
+                if (self._interruptRequested || this.isFlowAbortedReason(reason)) {
+                    this.addLog('[中断] 开锁流程已停止');
+                    this.setStateMessage(FLOW_ABORT_DISPLAY_MESSAGE);
+                    this.setData({ 'state.loading': false, autoRetrying: false });
+                    return;
+                }
+                if (this.shouldAutoRetryUnlock(reason, retryRemaining)) {
+                    retryRemaining -= 1;
+                    this.addLog('[自动重发] 扫描超时，立即重试，剩余 ' + retryRemaining + ' 次');
+                    this.setStateMessage('扫描超时，正在自动重发（剩余 ' + retryRemaining + ' 次）...');
+                    continue;
+                }
+                const displayReason = this.getReadableErrorMessage(reason);
+                this.setData({ 'state.loading': false, autoRetrying: false });
+                this.addLog('错误：' + displayReason);
+                this.setStateMessage(displayReason);
+                return;
+            }
+            finally {
+                self._flowStartAt = null;
+                if (self._bleFinalized) {
+                    self._bleFinalized = false;
+                }
+                else {
+                    await this.cleanupBluetooth();
+                    this.setData({ 'state.loading': false, autoRetrying: false });
+                }
             }
         }
     },
@@ -722,13 +878,13 @@ Page({
             return;
         }
         const now = new Date();
-        const stamp = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+        const stamp = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.${padMs(now.getMilliseconds())}`;
         const line = `${stamp} ${message}`;
         const syncToConsole = consoleOverride !== undefined ? consoleOverride : this.data.consoleSync;
         if (syncToConsole) {
             console.log(`[BLE] ${line}`);
         }
-        const logs = [...this.data.logs.slice(-19), line];
+        const logs = [...this.data.logs.slice(-(LOG_MAX_LINES - 1)), line];
         this.setData({ logs });
     },
     onClearLogs() {
@@ -757,11 +913,11 @@ Page({
         if (typeof wxAny.getSystemSetting === 'function') {
             try {
                 systemSetting = wxAny.getSystemSetting();
-                this.addLog(`[权限] getSystemSetting 成功：${JSON.stringify(systemSetting)}`);
+                this.addLog('[权限] getSystemSetting 成功：' + JSON.stringify(systemSetting));
             }
             catch (err) {
                 const errMsg = err && typeof err.errMsg === 'string' ? err.errMsg : String(err);
-                this.addLog(`[权限] getSystemSetting 失败：${errMsg}`);
+                this.addLog('[权限] getSystemSetting 失败：' + errMsg);
             }
         }
         else {
@@ -773,12 +929,16 @@ Page({
         this.addLog('系统蓝牙状态正常');
     },
     async ensureBluetoothReady() {
+        const start = Date.now();
+        this.addLog('[蓝牙] 调用 openBluetoothAdapter');
         try {
             await callWx(wx.openBluetoothAdapter, {});
+            this.addLog('[蓝牙] openBluetoothAdapter 成功，耗时 ' + (Date.now() - start) + 'ms');
         }
         catch (err) {
             const code = err && err && typeof err.errCode !== 'undefined' ? err.errCode : undefined;
             const msg = err && typeof err.errMsg === 'string' ? err.errMsg : '';
+            this.addLog('[蓝牙] openBluetoothAdapter 失败：' + formatError(err));
             if (msg.includes('暂不支持') || msg.includes('not support')) {
                 throw new Error('当前环境不支持蓝牙调试，请使用 Mac 开发者工具或真机测试');
             }
@@ -790,11 +950,14 @@ Page({
     },
     async discoverDevice(mac) {
         const self = this;
+        this.throwIfFlowAborted();
         const page = this;
         const target = normalizeMacForCompare(mac);
         const reversed = reverseMacHex(target);
         const targetName = (this.data.form.bluetoothName || '').toUpperCase();
         const targetNameHex = targetName ? asciiToHex(targetName) : '';
+        const scanStartedAt = Date.now();
+        this.addLog('[扫描] 开始，timeout=' + DISCOVERY_TIMEOUT + 'ms');
         await callWx(wx.stopBluetoothDevicesDiscovery, {}).catch(() => undefined);
         await callWx(wx.startBluetoothDevicesDiscovery, {
             allowDuplicatesKey: false,
@@ -805,6 +968,7 @@ Page({
         return new Promise((resolve, reject) => {
             let settled = false;
             const timer = setTimeout(() => {
+                page.addLog('[扫描] 超时，耗时 ' + (Date.now() - scanStartedAt) + 'ms，未匹配到目标设备');
                 cleanup();
                 reject(new Error('扫描蓝牙设备超时，请靠近门锁后重试'));
             }, DISCOVERY_TIMEOUT);
@@ -821,8 +985,12 @@ Page({
                     ? device.localName
                     : undefined;
                 const advertisData = device && device && device.advertisData;
-                const advertisPreview = advertisData ? (0, lockBiz_1.bufferToHex)(advertisData).slice(0, 32) : '无广播';
-                page.addLog(`发现设备: ${device.name || localName || '未知'} | ${device.deviceId} | ${advertisPreview}`);
+                const advertisPreview = advertisData ? previewHex((0, lockBiz_1.bufferToHex)(advertisData), 40) : '无广播';
+                const rssi = typeof device.RSSI === 'number' ? device.RSSI : 'NA';
+                const advLen = advertisData && typeof advertisData.byteLength === 'number'
+                    ? advertisData.byteLength
+                    : 0;
+                page.addLog(`发现设备: ${device.name || localName || '未知'} | ${device.deviceId} | RSSI=${rssi} | advLen=${advLen} | adv=${advertisPreview}`);
             };
             const listener = (res) => {
                 if (!res.devices)
@@ -849,22 +1017,22 @@ Page({
                     : '';
                 const name = ((device && device.name) || altName || '').toUpperCase();
                 if (name && targetName && name === targetName) {
-                    page.addLog(`匹配成功: 蓝牙名称 ${name}`);
+                    page.addLog(`匹配成功: 蓝牙名称=${name} deviceId=${device.deviceId}`);
                     return true;
                 }
                 const advertisData = device && device && device.advertisData;
                 if (advertisData) {
                     const advertisHex = (0, lockBiz_1.bufferToHex)(advertisData);
                     if (target && advertisHex.includes(target)) {
-                        page.addLog('匹配成功: 广播包含目标 MAC');
+                        page.addLog(`匹配成功: 广播包含目标 MAC deviceId=${device.deviceId}`);
                         return true;
                     }
                     if (reversed && advertisHex.includes(reversed)) {
-                        page.addLog('匹配成功: 广播包含反序 MAC');
+                        page.addLog(`匹配成功: 广播包含反序 MAC deviceId=${device.deviceId}`);
                         return true;
                     }
                     if (targetNameHex && advertisHex.includes(targetNameHex)) {
-                        page.addLog('匹配成功: 广播包含蓝牙名称 ASCII');
+                        page.addLog(`匹配成功: 广播包含蓝牙名称 ASCII deviceId=${device.deviceId}`);
                         return true;
                     }
                 }
@@ -876,32 +1044,50 @@ Page({
                 settled = true;
                 clearTimeout(timer);
                 wx.offBluetoothDeviceFound();
+                if (self._activeScanCancel === cancelScan) {
+                    self._activeScanCancel = null;
+                }
                 self._deviceFoundListener = null;
                 self._lastScanDevices = discovered;
-                page.addLog(`停止扫描，共记录设备 ${discovered.length} 个`);
+                page.addLog(`停止扫描，共记录设备 ${discovered.length} 个，耗时 ${Date.now() - scanStartedAt}ms`);
                 callWx(wx.stopBluetoothDevicesDiscovery, {}).catch(() => undefined);
             };
+            const cancelScan = () => {
+                if (settled) {
+                    return;
+                }
+                page.addLog('[扫描] 已中断');
+                cleanup();
+                reject(new Error(FLOW_ABORT_MESSAGE));
+            };
+            self._activeScanCancel = cancelScan;
             self._deviceFoundListener = listener;
             wx.onBluetoothDeviceFound(listener);
         });
     },
     async connectDevice(deviceId, timeout = 8000) {
         const self = this;
+        const start = Date.now();
+        this.addLog(`[连接] 发起连接 deviceId=${deviceId} timeout=${timeout}ms`);
         await callWx(wx.createBLEConnection, {
             deviceId,
             timeout
         });
         self._currentDeviceId = deviceId;
+        this.addLog(`[连接] 连接成功 deviceId=${deviceId} 耗时 ${Date.now() - start}ms`);
     },
     async prepareChannel(deviceId) {
+        const start = Date.now();
         const servicesRes = await callWx(wx.getBLEDeviceServices, {
             deviceId
         });
         const services = servicesRes.services || [];
+        this.addLog(`[服务] 查询完成，服务数=${services.length}`);
         const service = services.find((item) => SERVICE_CANDIDATES.includes(item.uuid.toLowerCase()));
         if (!service) {
             throw new Error('未找到目标蓝牙服务，请确认门锁已开启蓝牙广播');
         }
+        this.addLog(`[服务] 命中服务 serviceId=${service.uuid}`);
         const characteristicsRes = await callWx(wx.getBLEDeviceCharacteristics, {
             deviceId,
             serviceId: service.uuid
@@ -912,6 +1098,7 @@ Page({
         const notifyIds = characteristics
             .filter((item) => item.properties.notify || item.properties.indicate)
             .map((item) => item.uuid);
+        this.addLog(`[特征] 总数=${characteristics.length} read=${readable ? readable.uuid : '-'} write=${writable ? writable.uuid : '-'} notifyCount=${notifyIds.length}`);
         if (!readable || !writable) {
             throw new Error('未找到可读写的蓝牙特征');
         }
@@ -920,6 +1107,7 @@ Page({
         self._readId = readable.uuid;
         self._writeId = writable.uuid;
         self._notifyIds = notifyIds;
+        this.addLog(`[特征] 通道准备完成，耗时 ${Date.now() - start}ms`);
         return {
             serviceId: service.uuid,
             readId: readable.uuid,
@@ -928,17 +1116,25 @@ Page({
         };
     },
     async enableNotifications(deviceId, serviceId, notifyIds) {
+        this.addLog(`[通知] 开始订阅 notify 特征，数量=${notifyIds.length}`);
         for (const characteristicId of notifyIds) {
-            await callWx(wx.notifyBLECharacteristicValueChange, {
-                deviceId,
-                serviceId,
-                characteristicId,
-                state: true
-            }).catch(() => undefined);
+            try {
+                await callWx(wx.notifyBLECharacteristicValueChange, {
+                    deviceId,
+                    serviceId,
+                    characteristicId,
+                    state: true
+                });
+                this.addLog(`[通知] 已订阅 characteristicId=${characteristicId}`);
+            }
+            catch (err) {
+                this.addLog(`[通知] 订阅失败 characteristicId=${characteristicId} ${formatError(err)}`);
+            }
         }
     },
     async readSeed(deviceId, serviceId, characteristicId) {
         const self = this;
+        this.addLog(`[随机数] 开始读取 characteristicId=${characteristicId}`);
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 if (self._stage === 'waitingSeed') {
@@ -978,21 +1174,25 @@ Page({
         });
     },
     async writeCommand(deviceId, serviceId, characteristicId, command) {
+        this.addLog(`[写入] characteristicId=${characteristicId} bytes=${command.length}`);
         await callWx(wx.writeBLECharacteristicValue, {
             deviceId,
             serviceId,
             characteristicId,
             value: (0, lockBiz_1.sliceBuffer)(command)
         });
+        this.addLog(`[写入] 完成 characteristicId=${characteristicId}`);
     },
     waitForAck() {
         const self = this;
+        this.addLog(`[等待] 开始等待门锁回执，timeout=${FLOW_TIMEOUT}ms`);
         return new Promise((resolve) => {
             const timer = setTimeout(() => {
                 this.clearAckTimer();
                 if (self._stage === 'waitingAck') {
                     self._ackResolve = null;
                     self._stage = 'idle';
+                    this.addLog('[等待] 超时，未收到最终回执');
                     resolve(null);
                 }
             }, FLOW_TIMEOUT);
@@ -1010,23 +1210,26 @@ Page({
         const self = this;
         if (!res.value)
             return;
+        const hex = (0, lockBiz_1.bufferToHex)(res.value).toUpperCase();
         if (self._stage === 'waitingSeed' && self._seedResolve) {
             const resolver = self._seedResolve;
             self._seedResolve = null;
             self._stage = 'idle';
+            this.addLog(`[随机数] 读取成功 len=${res.value.byteLength}B value=${previewHex(hex)}`);
             resolver(res.value);
             return;
         }
-        const hex = (0, lockBiz_1.bufferToHex)(res.value).toUpperCase();
-        this.addLog(`收到通知：${hex}`);
+        this.addLog(`收到通知：[stage=${self._stage || 'idle'} len=${res.value.byteLength}B] ${previewHex(hex)}`);
         this.processBleNotification(hex, res.value).catch((err) => {
-            const message = err instanceof Error ? err.message : JSON.stringify(err);
-            this.addLog(`处理通知异常：${message}`);
+            const message = err instanceof Error ? err.message : formatError(err);
+            this.addLog('处理通知异常：' + message);
         });
     },
     async cleanupBluetooth() {
         const self = this;
+        this.addLog('[清理] 开始释放蓝牙资源');
         this.clearAckTimer();
+        self._activeScanCancel = null;
         if (self._deviceFoundListener) {
             wx.offBluetoothDeviceFound();
             self._deviceFoundListener = null;
@@ -1044,5 +1247,6 @@ Page({
         self._seedReject = null;
         self._ackResolve = null;
         self._randomSeed = null;
+        this.addLog('[清理] 蓝牙资源释放完成');
     }
 });

@@ -32,12 +32,144 @@ function resolvePlatform() {
     return '';
 }
 const DRAFT_STORAGE_KEY = 'configDraft';
+const SHARE_QUERY_KEY = 'sharedDoor';
+const SHARE_EXPIRE_QUERY_KEY = 'sharedDoorExp';
+const SHARE_PAYLOAD_VERSION = 1;
+const SHARE_LINK_TTL_MS = 24 * 60 * 60 * 1000;
 function buildCopyPayload(config) {
-    const name = config.doorName || '（未命名）';
-    const mac = config.mac || '（缺失）';
-    const key = config.key || '（缺失）';
-    const bluetooth = config.bluetoothName || '（缺失）';
+    const name = (config.doorName || '').trim() || '未命名';
+    const mac = (config.mac || '').trim() || '缺失';
+    const key = (config.key || '').trim() || '缺失';
+    const bluetooth = (config.bluetoothName || '').trim() || '缺失';
     return `门禁名称：${name}\nMAC：${mac}\nKey：${key}\n蓝牙名称：${bluetooth}`;
+}
+function buildCopyPayloadList(configs) {
+    const list = Array.isArray(configs) ? configs : [];
+    if (!list.length) {
+        return '';
+    }
+    if (list.length === 1) {
+        return buildCopyPayload(list[0]);
+    }
+    return list
+        .map((config, index) => `【门禁 ${index + 1}】\n${buildCopyPayload(config)}`)
+        .join('\n\n');
+}
+function encodeSharedDoor(config, expireAt) {
+    const normalized = (0, configView_1.normalizeConfigForForm)(config);
+    if (!(0, lockBiz_1.isValidMac)(normalized.mac) || !(0, lockBiz_1.isValidKey)(normalized.key)) {
+        return '';
+    }
+    const payload = {
+        v: SHARE_PAYLOAD_VERSION,
+        n: (normalized.doorName || '').trim(),
+        m: normalized.mac,
+        k: normalized.key,
+        b: (normalized.bluetoothName || '').trim(),
+        exp: expireAt
+    };
+    return encodeURIComponent(JSON.stringify(payload));
+}
+function parseShareExpireAt(options) {
+    if (!options || typeof options[SHARE_EXPIRE_QUERY_KEY] !== 'string') {
+        return null;
+    }
+    const expireAt = Number((options[SHARE_EXPIRE_QUERY_KEY] || '').trim());
+    if (!Number.isFinite(expireAt) || expireAt <= 0) {
+        return null;
+    }
+    return expireAt;
+}
+function decodeSharedDoor(raw, logEnabled, optionExpireAt) {
+    if (!raw) {
+        return null;
+    }
+    try {
+        const parsed = JSON.parse(decodeURIComponent(raw));
+        if (!parsed || parsed.v !== SHARE_PAYLOAD_VERSION) {
+            return null;
+        }
+        const payloadExpireAt = typeof parsed.exp === 'number' && Number.isFinite(parsed.exp) && parsed.exp > 0
+            ? parsed.exp
+            : null;
+        const expireAt = typeof optionExpireAt === 'number' && Number.isFinite(optionExpireAt) && optionExpireAt > 0
+            ? optionExpireAt
+            : payloadExpireAt;
+        if (!expireAt || Date.now() >= expireAt) {
+            return 'expired';
+        }
+        const normalized = (0, configView_1.normalizeConfigForForm)({
+            id: undefined,
+            doorName: typeof parsed.n === 'string' ? parsed.n : '',
+            mac: typeof parsed.m === 'string' ? parsed.m : '',
+            key: typeof parsed.k === 'string' ? parsed.k : '',
+            bluetoothName: typeof parsed.b === 'string' ? parsed.b : '',
+            logEnabled
+        });
+        if (!(0, lockBiz_1.isValidMac)(normalized.mac) || !(0, lockBiz_1.isValidKey)(normalized.key)) {
+            return null;
+        }
+        return normalized;
+    }
+    catch (err) {
+        return null;
+    }
+}
+function parseBackupDoorsFromText(text, logEnabled) {
+    const raw = (text || '').trim();
+    if (!raw) {
+        return [];
+    }
+    const lines = raw.split(/\r?\n/);
+    const blocks = [];
+    let current = { doorName: '', mac: '', key: '', bluetoothName: '' };
+    const pushCurrentIfNeeded = () => {
+        if (current.doorName || current.mac || current.key || current.bluetoothName) {
+            blocks.push(current);
+            current = { doorName: '', mac: '', key: '', bluetoothName: '' };
+        }
+    };
+    for (const rawLine of lines) {
+        const line = (rawLine || '').trim();
+        if (!line) {
+            continue;
+        }
+        if (/^【门禁\s*\d+】$/.test(line)) {
+            pushCurrentIfNeeded();
+            continue;
+        }
+        const nameMatch = line.match(/^门禁名称[：:]\s*(.+)$/i);
+        if (nameMatch) {
+            current.doorName = nameMatch[1].trim();
+            continue;
+        }
+        const macMatch = line.match(/^MAC[：:]\s*(.+)$/i);
+        if (macMatch) {
+            current.mac = macMatch[1].trim();
+            continue;
+        }
+        const keyMatch = line.match(/^Key[：:]\s*(.+)$/i);
+        if (keyMatch) {
+            current.key = keyMatch[1].trim();
+            continue;
+        }
+        const bluetoothMatch = line.match(/^蓝牙名称[：:]\s*(.+)$/i);
+        if (bluetoothMatch) {
+            current.bluetoothName = bluetoothMatch[1].trim();
+            continue;
+        }
+    }
+    pushCurrentIfNeeded();
+    return blocks
+        .map((item) => (0, configView_1.normalizeConfigForForm)({
+        id: undefined,
+        doorName: item.doorName || '导入门禁',
+        mac: item.mac,
+        key: item.key,
+        bluetoothName: item.bluetoothName,
+        logEnabled
+    }))
+        .filter((item) => (0, lockBiz_1.isValidMac)(item.mac) && (0, lockBiz_1.isValidKey)(item.key));
 }
 function readDraftState() {
     try {
@@ -78,31 +210,189 @@ Page({
         isIOS: false,
         logEnabled: false,
         quickUnlockEnabled: false,
+        autoRetryUnlockEnabled: false,
+        autoRetryUnlockCount: 8,
+        sharePrompt: {
+            visible: false,
+            countdown: 0
+        },
+        backupCopyPrompt: {
+            visible: false,
+            items: [],
+            selectedCount: 0
+        },
+        backupImportInput: {
+            visible: false,
+            text: ''
+        },
+        importPrompt: {
+            visible: false,
+            lines: []
+        },
         copyPrompt: {
             visible: false,
             lines: [],
             copyText: ''
         }
     },
-    onLoad() {
+    onLoad(options) {
         wx.showShareMenu({
             menus: ['shareAppMessage', 'shareTimeline']
         });
+        this.tryImportSharedDoor(options);
     },
     onShow() {
         this.detectPlatform();
         this.refreshConfigState();
     },
+    onHide() {
+        this.clearShareReminderTimer();
+    },
+    onUnload() {
+        this.clearShareReminderTimer();
+    },
     onShareAppMessage() {
+        const current = this.getCurrentForm();
+        const expireAt = Date.now() + SHARE_LINK_TTL_MS;
+        const encoded = encodeSharedDoor(current, expireAt);
+        if (!encoded) {
+            return {
+                title: 'BaiyunKeys',
+                path: '/pages/config/index'
+            };
+        }
+        const shareTitle = current.doorName ? `BaiyunKeys - ${current.doorName}` : 'BaiyunKeys - Door';
         return {
-            title: 'BaiyunKeys',
-            path: '/pages/config/index'
+            title: shareTitle,
+            path: `/pages/config/index?${SHARE_QUERY_KEY}=${encoded}&${SHARE_EXPIRE_QUERY_KEY}=${expireAt}`
         };
     },
     onShareTimeline() {
+        const current = this.getCurrentForm();
+        const expireAt = Date.now() + SHARE_LINK_TTL_MS;
+        const encoded = encodeSharedDoor(current, expireAt);
+        if (!encoded) {
+            return {
+                title: 'BaiyunKeys'
+            };
+        }
+        const shareTitle = current.doorName ? `BaiyunKeys - ${current.doorName}` : 'BaiyunKeys - Door';
         return {
-            title: 'BaiyunKeys'
+            title: shareTitle,
+            query: `${SHARE_QUERY_KEY}=${encoded}&${SHARE_EXPIRE_QUERY_KEY}=${expireAt}`
         };
+    },
+    showShareReminder() {
+        this.clearShareReminderTimer();
+        this.setData({
+            sharePrompt: {
+                visible: true,
+                countdown: 10
+            }
+        });
+        const timer = setInterval(() => {
+            const current = this.data.sharePrompt && typeof this.data.sharePrompt.countdown === 'number'
+                ? this.data.sharePrompt.countdown
+                : 0;
+            if (current <= 1) {
+                this.clearShareReminderTimer();
+                this.setData({ 'sharePrompt.countdown': 0 });
+                return;
+            }
+            this.setData({ 'sharePrompt.countdown': current - 1 });
+        }, 1000);
+        this._shareReminderTimer = timer;
+    },
+    clearShareReminderTimer() {
+        const self = this;
+        const timer = self._shareReminderTimer;
+        if (timer) {
+            clearInterval(timer);
+            self._shareReminderTimer = null;
+        }
+    },
+    onShareButtonTap() {
+        const form = this.getCurrentForm();
+        if (!form.id) {
+            wx.showToast({ title: '请先保存门禁', icon: 'none' });
+            return;
+        }
+        this.showShareReminder();
+    },
+    onShareReminderCancel() {
+        this.clearShareReminderTimer();
+        this.setData({
+            sharePrompt: {
+                visible: false,
+                countdown: 0
+            }
+        });
+    },
+    onShareReminderConfirm() {
+        if (this.data.sharePrompt && this.data.sharePrompt.countdown > 0) {
+            return;
+        }
+        setTimeout(() => {
+            this.onShareReminderCancel();
+        }, 80);
+    },
+    showImportPrompt(lines) {
+        this.setData({
+            importPrompt: {
+                visible: true,
+                lines: lines.filter((line) => !!line && !!line.trim())
+            }
+        });
+    },
+    onImportPromptConfirm() {
+        this.setData({
+            importPrompt: {
+                visible: false,
+                lines: []
+            }
+        });
+    },
+    tryImportSharedDoor(options) {
+        if (!options || typeof options[SHARE_QUERY_KEY] !== 'string') {
+            return;
+        }
+        const raw = (options[SHARE_QUERY_KEY] || '').trim();
+        if (!raw) {
+            return;
+        }
+        const optionExpireAt = parseShareExpireAt(options);
+        const logEnabled = (0, config_1.readLogPreference)();
+        const shared = decodeSharedDoor(raw, logEnabled, optionExpireAt);
+        if (shared === 'expired') {
+            wx.showToast({ title: '分享链接已过期，请重新分享', icon: 'none' });
+            return;
+        }
+        if (!shared) {
+            wx.showToast({ title: '分享门禁数据无效', icon: 'none' });
+            return;
+        }
+        const existingList = (0, config_1.readDoorConfigList)();
+        const duplicate = existingList.find((item) => item.mac === shared.mac &&
+            item.key === shared.key &&
+            item.bluetoothName === shared.bluetoothName);
+        if (duplicate) {
+            const active = (0, config_1.setActiveDoorConfig)(duplicate.id);
+            const refreshed = (0, config_1.readDoorConfigList)();
+            this.applyConfigState(active, refreshed);
+            wx.showToast({ title: '门禁已存在，已自动选中', icon: 'none' });
+            return;
+        }
+        const stored = (0, config_1.saveDoorConfig)(shared);
+        const refreshed = (0, config_1.readDoorConfigList)();
+        this.applyConfigState(stored, refreshed);
+        const name = stored.doorName || '未命名';
+        const bluetoothName = stored.bluetoothName || '无';
+        this.showImportPrompt([
+            `门禁名称：${name}`,
+            `MAC：${stored.mac}`,
+            `Key：${stored.key}`,
+            `蓝牙名称：${bluetoothName}`
+        ]);
     },
     detectPlatform() {
         const platform = resolvePlatform();
@@ -122,6 +412,8 @@ Page({
         const form = (0, configView_1.normalizeConfigForForm)(active);
         const logEnabled = (0, config_1.readLogPreference)();
         const quickUnlockEnabled = (0, config_1.readQuickUnlockPreference)();
+        const autoRetryUnlockEnabled = (0, config_1.readAutoRetryUnlockPreference)();
+        const autoRetryUnlockCount = (0, config_1.readAutoRetryUnlockCountPreference)();
         const nextForm = { ...form, logEnabled };
         const { configs, configNames, configOptions, selectedConfigIndex } = (0, configView_1.buildConfigCollections)(list, form.id || null);
         this.setData({
@@ -132,7 +424,9 @@ Page({
             selectedConfigIndex,
             selectorOpen: false,
             logEnabled,
-            quickUnlockEnabled
+            quickUnlockEnabled,
+            autoRetryUnlockEnabled,
+            autoRetryUnlockCount
         });
         this.updateCanSave(nextForm);
     },
@@ -270,6 +564,174 @@ Page({
             }
         });
     },
+    onCopyBackup() {
+        const list = (0, config_1.readDoorConfigList)();
+        if (!list.length) {
+            wx.showToast({ title: '暂无可复制门禁，请先保存配置', icon: 'none' });
+            return;
+        }
+        const activeId = this.getCurrentForm().id || list[0].id;
+        const items = list.map((item, index) => ({
+            id: item.id,
+            name: (item.doorName || '').trim() || `门禁 ${index + 1}`,
+            checked: item.id === activeId
+        }));
+        const selectedCount = items.filter((item) => item.checked).length;
+        this.setData({
+            backupCopyPrompt: {
+                visible: true,
+                items,
+                selectedCount
+            }
+        });
+    },
+    onImportBackup() {
+        this.setData({
+            backupImportInput: {
+                visible: true,
+                text: ''
+            }
+        });
+    },
+    onBackupCopyCancel() {
+        this.setData({
+            backupCopyPrompt: {
+                visible: false,
+                items: [],
+                selectedCount: 0
+            }
+        });
+    },
+    onBackupCopyToggle(event) {
+        const id = event.currentTarget.dataset.id;
+        if (!id) {
+            return;
+        }
+        const items = this.data.backupCopyPrompt.items.map((item) => item.id === id ? { ...item, checked: !item.checked } : item);
+        const selectedCount = items.filter((item) => item.checked).length;
+        this.setData({
+            backupCopyPrompt: {
+                visible: true,
+                items,
+                selectedCount
+            }
+        });
+    },
+    onBackupCopyToggleAll() {
+        const state = this.data.backupCopyPrompt;
+        const targetChecked = !(state.selectedCount === state.items.length && state.items.length > 0);
+        const items = state.items.map((item) => ({ ...item, checked: targetChecked }));
+        const selectedCount = targetChecked ? items.length : 0;
+        this.setData({
+            backupCopyPrompt: {
+                visible: true,
+                items,
+                selectedCount
+            }
+        });
+    },
+    onBackupCopyConfirm() {
+        const state = this.data.backupCopyPrompt;
+        const selectedIds = state.items.filter((item) => item.checked).map((item) => item.id);
+        if (!selectedIds.length) {
+            wx.showToast({ title: '请先勾选门禁', icon: 'none' });
+            return;
+        }
+        const selectedConfigs = (0, config_1.readDoorConfigList)().filter((item) => selectedIds.includes(item.id));
+        if (!selectedConfigs.length) {
+            wx.showToast({ title: '未找到可复制的门禁', icon: 'none' });
+            return;
+        }
+        const copyText = buildCopyPayloadList(selectedConfigs);
+        wx.setClipboardData({
+            data: copyText,
+            success: () => {
+                this.onBackupCopyCancel();
+                wx.showToast({ title: '门禁参数已复制', icon: 'success', duration: 1200 });
+            },
+            fail: () => wx.showToast({ title: '复制失败，请重试', icon: 'none', duration: 1600 })
+        });
+    },
+    onBackupImportInput(event) {
+        const value = event.detail && typeof event.detail.value === 'string' ? event.detail.value : '';
+        this.setData({ 'backupImportInput.text': value });
+    },
+    onBackupImportCancel() {
+        this.setData({
+            backupImportInput: {
+                visible: false,
+                text: ''
+            }
+        });
+    },
+    onBackupImportConfirm() {
+        const text = this.data.backupImportInput.text || '';
+        const importedList = parseBackupDoorsFromText(text, this.data.logEnabled);
+        if (!importedList.length) {
+            wx.showToast({ title: '未识别到有效门禁参数', icon: 'none' });
+            return;
+        }
+        const comparePool = (0, config_1.readDoorConfigList)().slice();
+        const imported = [];
+        let duplicateCount = 0;
+        let duplicateNameCount = 0;
+        let iosMissingBtCount = 0;
+        for (const config of importedList) {
+            if (this.data.isIOS && !config.bluetoothName) {
+                iosMissingBtCount += 1;
+                continue;
+            }
+            const duplicated = comparePool.find((item) => item.mac === config.mac &&
+                item.key === config.key &&
+                item.bluetoothName === config.bluetoothName);
+            if (duplicated) {
+                duplicateCount += 1;
+                continue;
+            }
+            const duplicatedName = comparePool.some((item) => (item.doorName || '').trim() === config.doorName);
+            if (duplicatedName) {
+                duplicateNameCount += 1;
+                continue;
+            }
+            const stored = (0, config_1.saveDoorConfig)(config);
+            comparePool.push(stored);
+            imported.push(stored);
+        }
+        if (!imported.length) {
+            if (iosMissingBtCount > 0) {
+                wx.showToast({ title: 'iOS 导入需包含蓝牙名称', icon: 'none' });
+                return;
+            }
+            if (duplicateNameCount > 0) {
+                wx.showToast({ title: '门禁名称重复，导入失败', icon: 'none' });
+                return;
+            }
+            wx.showToast({ title: '门禁已存在，无需重复导入', icon: 'none' });
+            return;
+        }
+        const active = (0, config_1.setActiveDoorConfig)(imported[0].id);
+        const refreshed = (0, config_1.readDoorConfigList)();
+        this.applyConfigState(active, refreshed);
+        this.onBackupImportCancel();
+        const lines = [`成功导入 ${imported.length} 套门禁`];
+        if (duplicateCount > 0) {
+            lines.push(`已跳过重复参数：${duplicateCount} 套`);
+        }
+        imported.forEach((item, index) => {
+            lines.push(`【门禁 ${index + 1}】`);
+            lines.push(`门禁名称：${item.doorName || '未命名'}`);
+            lines.push(`MAC：${item.mac}`);
+            lines.push(`Key：${item.key}`);
+            lines.push(`蓝牙名称：${item.bluetoothName || '无'}`);
+        });
+        if (duplicateNameCount > 0) {
+            lines.push(`已跳过重名门禁：${duplicateNameCount} 套`);
+        }
+        if (iosMissingBtCount > 0) {
+            lines.push(`已跳过缺少蓝牙名（iOS 必填）：${iosMissingBtCount} 套`);
+        }
+        this.showImportPrompt(lines);
+    },
     toggleConfigSelector() {
         if (!this.data.configs.length) {
             wx.showToast({ title: '请先新增并保存门禁', icon: 'none' });
@@ -333,6 +795,27 @@ Page({
         this.setData({ quickUnlockEnabled: next });
         wx.showToast({ title: next ? '已开启快速开锁' : '已关闭快速开锁', icon: 'none', duration: 1200 });
     },
+    onAutoRetryUnlockCountInput(event) {
+        const raw = (event.detail.value || '').replace(/\D/g, '');
+        if (!raw) {
+            this.setData({ autoRetryUnlockCount: '' });
+            return;
+        }
+        const normalized = (0, config_1.normalizeAutoRetryUnlockCount)(raw);
+        this.setData({ autoRetryUnlockCount: normalized });
+    },
+    onAutoRetryUnlockCountBlur(event) {
+        const raw = (event.detail.value || '').replace(/\D/g, '');
+        const normalized = (0, config_1.normalizeAutoRetryUnlockCount)(raw);
+        (0, config_1.saveAutoRetryUnlockCountPreference)(normalized);
+        this.setData({ autoRetryUnlockCount: normalized });
+    },
+    onAutoRetryUnlockToggle(event) {
+        const next = !!event.detail.value;
+        (0, config_1.saveAutoRetryUnlockPreference)(next);
+        this.setData({ autoRetryUnlockEnabled: next });
+        wx.showToast({ title: next ? '已开启自动重发' : '已关闭自动重发', icon: 'none', duration: 1200 });
+    },
     normalizeFetchedConfig(item) {
         const current = this.getCurrentForm();
         const base = {
@@ -344,7 +827,8 @@ Page({
             logEnabled: this.data.logEnabled
         };
         const normalized = (0, configView_1.normalizeConfigForForm)(base);
-        if (!(0, lockBiz_1.isValidMac)(normalized.mac) || !(0, lockBiz_1.isValidKey)(normalized.key) || !normalized.bluetoothName) {
+        const requiresBluetoothName = !!this.data.isIOS;
+        if (!(0, lockBiz_1.isValidMac)(normalized.mac) || !(0, lockBiz_1.isValidKey)(normalized.key) || (requiresBluetoothName && !normalized.bluetoothName)) {
             throw new Error('返回的门锁参数不完整或格式无效');
         }
         return normalized;
@@ -367,34 +851,69 @@ Page({
             if (!list.length) {
                 throw new Error('未获取到门禁信息');
             }
-            const config = this.normalizeFetchedConfig(list[0]);
-            const existingList = (0, config_1.readDoorConfigList)();
-            const duplicate = existingList.find((item) => item.doorName === config.doorName &&
-                item.mac === config.mac &&
-                item.key === config.key &&
-                item.bluetoothName === config.bluetoothName &&
-                item.logEnabled === config.logEnabled);
-            if (duplicate) {
-                const active = (0, config_1.setActiveDoorConfig)(duplicate.id);
-                const refreshed = (0, config_1.readDoorConfigList)();
-                this.applyConfigState(active, refreshed);
-                wx.showToast({ title: '已存在相同门禁，已为你选中', icon: 'none' });
-                this.setData({ loginForm: createLoginForm() });
-                this.clearDraft();
-                await this.showCopyReminder(buildCopyPayload(active));
-                return;
+            const isSameConfig = (left, right) => left.doorName === right.doorName &&
+                left.mac === right.mac &&
+                left.key === right.key &&
+                left.bluetoothName === right.bluetoothName;
+            const comparePool = (0, config_1.readDoorConfigList)().slice();
+            const imported = [];
+            let firstDuplicate = null;
+            let duplicateCount = 0;
+            let skippedCount = 0;
+            for (const item of list) {
+                let config;
+                try {
+                    config = this.normalizeFetchedConfig(item);
+                }
+                catch (normalizeErr) {
+                    skippedCount += 1;
+                    continue;
+                }
+                const duplicate = comparePool.find((entry) => isSameConfig(entry, config));
+                if (duplicate) {
+                    duplicateCount += 1;
+                    if (!firstDuplicate) {
+                        firstDuplicate = duplicate;
+                    }
+                    continue;
+                }
+                const stored = (0, config_1.saveDoorConfig)(config);
+                comparePool.push(stored);
+                imported.push(stored);
             }
-            const stored = (0, config_1.saveDoorConfig)(config);
+            if (!imported.length) {
+                if (firstDuplicate) {
+                    const active = (0, config_1.setActiveDoorConfig)(firstDuplicate.id);
+                    const refreshed = (0, config_1.readDoorConfigList)();
+                    this.applyConfigState(active, refreshed);
+                    wx.showToast({ title: '已存在相同门禁，已为你选中', icon: 'none' });
+                    this.setData({ loginForm: createLoginForm() });
+                    this.clearDraft();
+                    await this.showCopyReminder(buildCopyPayload(active));
+                    return;
+                }
+                throw new Error('未获取到可导入的门禁信息');
+            }
+            const firstImported = imported[0];
+            const active = (0, config_1.setActiveDoorConfig)(firstImported.id);
             const refreshed = (0, config_1.readDoorConfigList)();
-            this.applyConfigState(stored, refreshed);
+            this.applyConfigState(active, refreshed);
+            console.info('[config] remote guard import summary', {
+                total: list.length,
+                imported: imported.length,
+                duplicateCount,
+                skippedCount
+            });
             this.setData({ loginForm: createLoginForm() });
             this.clearDraft();
-            await this.showCopyReminder(buildCopyPayload(stored));
+            const copyPayload = buildCopyPayloadList(imported);
+            await this.showCopyReminder(copyPayload || buildCopyPayload(active));
         }
         catch (err) {
             const message = err instanceof Error ? err.message : '获取配置失败';
             console.error('[config] 获取远程配置失败', err);
-            wx.showToast({ title: message, icon: 'none' });
+            const toastDuration = message.length > 20 ? 5000 : 3000;
+            wx.showToast({ title: message, icon: 'none', duration: toastDuration });
         }
         finally {
             this.setData({ fetchingRemote: false });
@@ -413,6 +932,17 @@ Page({
                 ...this.getCurrentForm(),
                 logEnabled: this.data.logEnabled
             });
+            if (!payload.bluetoothName && payload.id) {
+                const existing = (0, config_1.readDoorConfigList)().find((item) => item.id === payload.id);
+                if (existing && existing.bluetoothName) {
+                    payload.bluetoothName = existing.bluetoothName;
+                }
+            }
+            const existsSameName = (0, config_1.readDoorConfigList)().some((item) => item.id !== payload.id && ((item.doorName || '').trim() === payload.doorName));
+            if (existsSameName) {
+                wx.showToast({ title: '门禁名称重复，请重新命名后再保存', icon: 'none' });
+                return;
+            }
             const stored = (0, config_1.saveDoorConfig)(payload);
             const refreshed = (0, config_1.readDoorConfigList)();
             this.applyConfigState(stored, refreshed);
